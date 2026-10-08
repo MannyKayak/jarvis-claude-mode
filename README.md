@@ -66,7 +66,8 @@ Everything lives in `~/.claude`, so it works in every repo:
 
 - `skills/jarvis-mode/`: the script, the `/jarvis-mode` command and a copy of the installer;
 - `settings.json`: the `Stop` and `UserPromptSubmit` hooks are added. The file is merged, never overwritten, and a copy is saved first as `settings.json.bak-<date>`;
-- `jarvis.json`, `jarvis.on`, `jarvis.pid`: settings and state.
+- `jarvis.json`, `jarvis.on`, `jarvis.pid`, `jarvis.ack`: settings and state;
+- with the online voices only: `jarvis-venv/` (the edge-tts package) and `jarvis-cache/` (the stock phrases, pre-generated).
 
 ## Usage
 
@@ -75,6 +76,12 @@ Everything lives in `~/.claude`, so it works in every repo:
 /jarvis-mode on|off|status
 /jarvis-mode setting      changes language, voice and name
 ```
+
+### No silent waits
+
+The moment you send a message, Jarvis says a short phrase such as "Sure, let me take a look", while Claude is already working on the reply. If the reply still has not come three seconds after that, it adds one "Still thinking". Both stop as soon as the reply arrives. These are stock phrases spoken by the script itself: they cost no tokens and do not slow Claude down.
+
+Available in English and Italian; with other languages Jarvis simply waits in silence. Turn it off with `/jarvis-mode setting`.
 
 ### Voice commands
 

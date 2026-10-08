@@ -11,6 +11,9 @@ Subcommands:
   say <text>               tries the TTS engine, ignoring the switch
   version                  prints the installed version
 
+With the acknowledgement on, a short "on it" phrase is spoken as soon as a prompt is sent,
+followed by one "still thinking" if the reply has not come a few seconds later.
+
 Environment variables:
   JARVIS_TTS_CMD   shell command that receives the text (UTF-8) on stdin; replaces the default engine
   JARVIS_VOICE     voice for the default engine, used when none was picked with "setting"
@@ -22,22 +25,27 @@ Speech engines:
 
 A hook must never break the session: any error -> silent exit 0.
 """
+import hashlib
 import json
 import os
+import random
 import re
 import shutil
 import signal
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
 FLAG = CLAUDE_DIR / "jarvis.on"
 PIDFILE = CLAUDE_DIR / "jarvis.pid"
 CONFIG = CLAUDE_DIR / "jarvis.json"
-VERSION = "1.1.0"
-CONFIG_KEYS = ("engine", "lang", "voice", "name")
+VERSION = "1.2.0"
+CONFIG_KEYS = ("engine", "lang", "voice", "name", "ack")
+CACHE = CLAUDE_DIR / "jarvis-cache"
+ACK_STATE = CLAUDE_DIR / "jarvis.ack"
 ENGINES = ("system", "edge")
 VENV = CLAUDE_DIR / "jarvis-venv"
 EDGE_MARKER = VENV / "edge-tts.ok"
@@ -74,6 +82,39 @@ INSTRUCTION = (
 
 # Phrases spoken by the tool itself, by language prefix; English otherwise.
 GREETINGS = {"it": "{name} è al tuo servizio.", "en": "{name} is ready."}
+# Spoken the moment a prompt is sent. Languages without an entry get no acknowledgement.
+ACKS = {
+    "it": (
+        "Va bene, ci do subito un'occhiata.",
+        "D'accordo, dammi solo un momento.",
+        "Ricevuto, mi metto al lavoro.",
+        "Certo, vediamo un po' cosa si può fare.",
+        "Ok, ci penso io, un attimo.",
+        "Un momento che controllo.",
+    ),
+    "en": (
+        "Sure, let me take a look.",
+        "Got it, give me a moment.",
+        "Alright, I'm on it.",
+        "Okay, let me see what I can do.",
+        "On it, just a second.",
+        "One moment while I check.",
+    ),
+}
+# Spoken once when the reply is still not there STILL_AFTER seconds after the acknowledgement.
+STILL = {
+    "it": (
+        "Sto ancora ragionando, un attimo.",
+        "Ci sto ancora lavorando.",
+        "Mi serve ancora qualche secondo.",
+    ),
+    "en": (
+        "Still thinking, one moment.",
+        "Still working on it.",
+        "I need a few more seconds.",
+    ),
+}
+STILL_AFTER = 3
 FAREWELLS = {"it": "A dopo.", "en": "See you later."}
 SAMPLES = {"it": "Questa è la mia voce.", "en": "This is my voice."}
 
@@ -164,7 +205,7 @@ def system_lang():
 
 
 def load_config():
-    cfg = {"engine": "system", "lang": system_lang(), "voice": "", "name": "Jarvis"}
+    cfg = {"engine": "system", "lang": system_lang(), "voice": "", "name": "Jarvis", "ack": "on"}
     try:
         data = json.loads(CONFIG.read_text(encoding="utf-8"))
         cfg.update({k: v for k, v in data.items() if k in CONFIG_KEYS and isinstance(v, str) and v})
@@ -309,17 +350,21 @@ def audio_player():
     return None
 
 
-def play_file(path):
-    """Plays an audio file and waits for it to end. Raises when no player is available."""
+def player_command(path):
+    """Command and environment that play an audio file and wait for it to end."""
     if WINDOWS:
         cmd = ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", PS_PLAY]
-        subprocess.run(cmd, env=dict(os.environ, JARVIS_FILE=path), check=True,
-                       capture_output=True, creationflags=CREATE_NO_WINDOW)
-        return
+        return cmd, dict(os.environ, JARVIS_FILE=str(path))
     player = audio_player()
     if not player:
         raise RuntimeError("no audio player")
-    subprocess.run(player + [path], check=True, capture_output=True)
+    return player + [str(path)], dict(os.environ)
+
+
+def play_file(path):
+    cmd, env = player_command(path)
+    flags = {"creationflags": CREATE_NO_WINDOW} if WINDOWS else {}
+    subprocess.run(cmd, env=env, check=True, capture_output=True, **flags)
 
 
 def cmd_edge_play():
@@ -353,6 +398,30 @@ def cmd_edge_play():
             os.unlink(path)
         except OSError:
             pass
+
+
+def cmd_edge_cache():
+    """Runs inside the private environment: synthesizes the acknowledgements not yet cached."""
+    import asyncio
+
+    import edge_tts
+
+    cfg = load_config()
+    CACHE.mkdir(parents=True, exist_ok=True)
+    for text in ack_phrases(cfg) + still_phrases(cfg):
+        target = ack_file(cfg["voice"], text)
+        if target.exists():
+            continue
+        partial = target.with_suffix(".part")
+        try:
+            talk = edge_tts.Communicate(text, cfg["voice"])
+            asyncio.run(asyncio.wait_for(talk.save(str(partial)), 30))
+            os.replace(partial, target)
+        except Exception:
+            try:
+                partial.unlink()
+            except OSError:
+                pass
 
 
 def cmd_edge_voices():
@@ -409,16 +478,44 @@ def stop_speaking():
         if proc_token(pid) != token:
             return
         if WINDOWS:
-            subprocess.run(
+            # Not awaited: taskkill takes a few hundred milliseconds the hook should not spend.
+            subprocess.Popen(
                 ["taskkill", "/PID", str(pid), "/T", "/F"],
-                capture_output=True,
-                timeout=5,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
                 creationflags=CREATE_NO_WINDOW,
             )
         else:
             os.killpg(pid, signal.SIGTERM)
     except Exception:
         pass
+
+
+def spawn_detached(cmd, env, text="", shell=False, track=True):
+    """Starts a process that outlives the hook. Tracked, it is the playback a new prompt silences."""
+    kwargs = dict(
+        env=env,
+        shell=shell,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    if WINDOWS:
+        flags = CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
+        try:
+            proc = subprocess.Popen(cmd, creationflags=flags | CREATE_BREAKAWAY_FROM_JOB, **kwargs)
+        except OSError:
+            # The parent's job object does not allow breakaway.
+            proc = subprocess.Popen(cmd, creationflags=flags, **kwargs)
+    else:
+        proc = subprocess.Popen(cmd, start_new_session=True, **kwargs)
+    if track:
+        PIDFILE.write_text(
+            json.dumps({"pid": proc.pid, "token": proc_token(proc.pid)}), encoding="utf-8"
+        )
+    proc.stdin.write(text.encode("utf-8"))
+    proc.stdin.close()
 
 
 def speak(text, cfg=None):
@@ -433,28 +530,79 @@ def speak(text, cfg=None):
         default, env = tts_command(
             cfg["lang"], voice or os.environ.get("JARVIS_VOICE", "").strip()
         )
-    kwargs = dict(
-        env=env,
-        shell=bool(custom),
-        stdin=subprocess.PIPE,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    cmd = custom or default
-    if WINDOWS:
-        flags = CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
-        try:
-            proc = subprocess.Popen(cmd, creationflags=flags | CREATE_BREAKAWAY_FROM_JOB, **kwargs)
-        except OSError:
-            # The parent's job object does not allow breakaway.
-            proc = subprocess.Popen(cmd, creationflags=flags, **kwargs)
-    else:
-        proc = subprocess.Popen(cmd, start_new_session=True, **kwargs)
-    PIDFILE.write_text(
-        json.dumps({"pid": proc.pid, "token": proc_token(proc.pid)}), encoding="utf-8"
-    )
-    proc.stdin.write(text.encode("utf-8"))
-    proc.stdin.close()
+    spawn_detached(custom or default, env, text, shell=bool(custom))
+
+
+def ack_phrases(cfg):
+    return ACKS.get(cfg["lang"][:2].lower(), ())
+
+
+def still_phrases(cfg):
+    return STILL.get(cfg["lang"][:2].lower(), ())
+
+
+def ack_file(voice, text):
+    digest = hashlib.sha1(f"{voice}|{text}".encode("utf-8")).hexdigest()[:16]
+    return CACHE / f"{digest}.mp3"
+
+
+def warm_ack_cache(cfg):
+    """Online voices take seconds to synthesize: prepare the stock phrases ahead of time."""
+    if (cfg["ack"] != "off" and cfg["engine"] == "edge" and cfg["voice"] and edge_ready()
+            and ack_phrases(cfg)):
+        spawn_detached([str(venv_python()), os.path.abspath(__file__), "edge-cache"],
+                       dict(os.environ), track=False)
+
+
+def acknowledge(cfg):
+    """Starts the turn's companion process, which fills the wait for the reply."""
+    phrases = ack_phrases(cfg)
+    if not phrases:
+        return
+    try:
+        last = int(ACK_STATE.read_text(encoding="utf-8"))
+    except Exception:
+        last = -1
+    pick = random.choice([i for i in range(len(phrases)) if i != last] or [0])
+    try:
+        ACK_STATE.write_text(str(pick), encoding="utf-8")
+    except OSError:
+        pass
+    spawn_detached([sys.executable, os.path.abspath(__file__), "attend"],
+                   dict(os.environ), phrases[pick])
+
+
+def say_blocking(text, cfg):
+    """Speaks a stock phrase and waits for it to end. Online voices only play what is cached."""
+    flags = {"creationflags": CREATE_NO_WINDOW} if WINDOWS else {}
+    custom = os.environ.get("JARVIS_TTS_CMD", "").strip()
+    online = cfg["engine"] == "edge" and cfg["voice"] and edge_ready()
+    if online and not custom:
+        ready = ack_file(cfg["voice"], text)
+        if ready.exists():
+            play_file(ready)
+        else:
+            warm_ack_cache(cfg)  # stay quiet this time rather than answer late
+        return
+    voice = cfg["voice"] if cfg["engine"] == "system" else ""
+    cmd, env = tts_command(cfg["lang"], voice or os.environ.get("JARVIS_VOICE", "").strip())
+    subprocess.run(custom or cmd, shell=bool(custom), input=text.encode("utf-8"), env=env,
+                   capture_output=True, **flags)
+
+
+def cmd_attend():
+    """A turn's companion: says the acknowledgement on stdin, then one "still thinking" if the
+    reply is slow. It is the tracked playback, so the Stop hook or the next prompt ends it."""
+    text = sys.stdin.buffer.read().decode("utf-8", "replace")
+    cfg = load_config()
+    try:
+        say_blocking(text, cfg)
+    except Exception:
+        pass
+    time.sleep(STILL_AFTER)
+    phrases = still_phrases(cfg)
+    if phrases and FLAG.exists():
+        say_blocking(random.choice(phrases), cfg)
 
 
 def strip_markdown(text):
@@ -554,6 +702,12 @@ def cmd_prompt():
         print(json.dumps({"decision": "block", "reason": status_line(cfg)}))
         return
     if FLAG.exists():
+        typed = prompt.strip() if isinstance(prompt, str) else ""
+        if cfg["ack"] != "off" and typed and typed[0] not in "/!#":
+            try:
+                acknowledge(cfg)
+            except Exception:
+                pass
         out = {
             "hookSpecificOutput": {
                 "hookEventName": "UserPromptSubmit",
@@ -575,7 +729,7 @@ def status_line(cfg):
     state = "ON" if FLAG.exists() else "OFF"
     voice = cfg["voice"] or "system default"
     return (f"Jarvis mode: {state} (name: {cfg['name']}, engine: {cfg['engine']}, "
-            f"language: {cfg['lang']}, voice: {voice})")
+            f"language: {cfg['lang']}, voice: {voice}, acknowledgement: {cfg['ack']})")
 
 
 def voices_by_lang(voices):
@@ -620,8 +774,12 @@ def print_setup(cfg):
         "If there is a single voice, use it and say so.\n"
         "4. Voice assistant name: offer the current name and a couple of alternatives; "
         "the user can type their own.\n"
+        "5. Acknowledgement: on or off. When on, a short phrase such as \"Sure, let me take a "
+        "look\" is spoken the moment they send a message, and \"Still thinking\" follows if "
+        "the reply takes a few seconds more, so the wait is not silent.\n"
         "Then run this command, with the voice name without the part in parentheses:\n"
-        f'{me} config --engine <engine> --lang <language> --voice "<voice>" --name "<name>"\n'
+        f'{me} config --engine <engine> --lang <language> --voice "<voice>" --name "<name>" '
+        "--ack <on|off>\n"
         "The command saves the settings and plays the new voice. Report the outcome in one line."
     )
 
@@ -657,8 +815,13 @@ def cmd_config(args):
     new = dict(zip([a.lstrip("-") for a in args[0::2]], args[1::2]))
     if len(args) % 2 or set(new) - set(CONFIG_KEYS):
         print('Usage: config [--engine system|edge] [--lang <language>] [--voice "<voice>"] '
-              '[--name "<name>"]')
+              '[--name "<name>"] [--ack on|off]')
         return
+    if "ack" in new:
+        if new["ack"].strip().lower() not in ("on", "off"):
+            print(f"Acknowledgement must be on or off, not: {new['ack']}")
+            return
+        cfg["ack"] = new["ack"].strip().lower()
     if "engine" in new:
         engine = new["engine"].strip().lower()
         if engine not in ENGINES:
@@ -718,6 +881,7 @@ def cmd_config(args):
     save_config(cfg)
     print("Saved. " + status_line(cfg))
     speak(greeting(cfg), cfg)
+    warm_ack_cache(cfg)
 
 
 def main():
@@ -745,6 +909,10 @@ def main():
         print(VERSION)
     elif cmd == "edge-play":
         cmd_edge_play()
+    elif cmd == "attend":
+        cmd_attend()
+    elif cmd == "edge-cache":
+        cmd_edge_cache()
     elif cmd == "edge-voices":
         cmd_edge_voices()
     elif cmd == "say":

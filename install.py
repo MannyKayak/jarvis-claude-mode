@@ -29,7 +29,7 @@ SKILL_DIR = CLAUDE_DIR / "skills" / "jarvis-mode"
 SCRIPT = SKILL_DIR / "jarvis.py"
 SOURCE = Path(__file__).resolve().parent / "jarvis.py"
 EVENTS = (("Stop", "stop"), ("UserPromptSubmit", "prompt"))
-STATE_FILES = ("jarvis.on", "jarvis.pid", "jarvis.json")
+STATE_FILES = ("jarvis.on", "jarvis.pid", "jarvis.json", "jarvis.ack")
 
 SKILL_MD = """---
 name: jarvis-mode
@@ -349,7 +349,14 @@ def configure(voices):
             cfg["name"] = name
             break
         print("   Invalid name: use letters, digits and spaces.")
+    wants_ack = confirm('   Say a short phrase like "Sure, let me take a look" the moment you '
+                        "send a message, so the wait is not silent?")
+    cfg["ack"] = "on" if wants_ack else "off"
     jarvis.save_config(cfg)
+    try:
+        jarvis.warm_ack_cache(cfg)
+    except Exception:
+        pass
     return cfg
 
 
@@ -416,6 +423,7 @@ def cmd_uninstall(dry_run):
     jarvis.stop_speaking()
     shutil.rmtree(SKILL_DIR, ignore_errors=True)
     shutil.rmtree(jarvis.VENV, ignore_errors=True)
+    shutil.rmtree(jarvis.CACHE, ignore_errors=True)
     for name in STATE_FILES:
         try:
             (CLAUDE_DIR / name).unlink()
