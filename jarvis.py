@@ -193,6 +193,17 @@ def sample(cfg):
     return phrase(SAMPLES, cfg)
 
 
+def parse_say_voices(listing):
+    """Voices from `say -v ?`. Lines look like "Alice               it_IT    # Ciao!", but
+    long names such as "Eddy (Italian (Italy)) it_IT    # Ciao!" keep a single space."""
+    voices = []
+    for line in listing.splitlines():
+        m = re.match(r"(.+?)\s+([a-z]{2,3})[_-]([A-Za-z0-9]{2,})\s+#", line)
+        if m:
+            voices.append({"name": m[1].strip(), "lang": f"{m[2]}-{m[3]}", "gender": ""})
+    return voices
+
+
 def venv_python():
     return VENV / ("Scripts/python.exe" if WINDOWS else "bin/python")
 
@@ -254,10 +265,7 @@ def list_voices(engine="system"):
             voices.append({"name": name, "lang": lang, "gender": gender.lower()})
     elif sys.platform == "darwin":
         out = subprocess.run(["say", "-v", "?"], capture_output=True, text=True, timeout=10).stdout
-        for line in out.splitlines():
-            m = re.match(r"(.+?)\s{2,}([a-z]{2,3})[_-]([A-Za-z0-9]{2,})\s+#", line)
-            if m:
-                voices.append({"name": m[1].strip(), "lang": f"{m[2]}-{m[3]}", "gender": ""})
+        voices = parse_say_voices(out)
     else:
         out = subprocess.run(
             ["espeak-ng", "--voices"], capture_output=True, text=True, timeout=10
@@ -680,8 +688,12 @@ def cmd_config(args):
             cfg["voice"] = ""  # the old voice speaks another language
         cfg["lang"] = match[0]
     if "voice" in new:
-        wanted = re.sub(r"\s*\([^)]*\)\s*$", "", new["voice"]).strip().lower()
-        match = [v for v in voices if v["name"].lower() == wanted and v["lang"] == cfg["lang"]]
+        # The name as given first: some real names end in parentheses, like our own labels do.
+        exact = new["voice"].strip().lower()
+        bare = re.sub(r"\s*\([^)]*\)\s*$", "", exact).strip()
+        in_lang = [v for v in voices if v["lang"] == cfg["lang"]]
+        match = ([v for v in in_lang if v["name"].lower() == exact]
+                 or [v for v in in_lang if v["name"].lower() == bare])
         if not match:
             available = ", ".join(voices_by_lang(voices).get(cfg["lang"], []))
             print(f"No such {cfg['engine']} voice for {cfg['lang']}: {new['voice']}. Available: {available}")
