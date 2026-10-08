@@ -9,6 +9,7 @@ Subcommands:
   config [--engine E] [--lang X] [--voice Y] [--name Z]   saves engine, language, voice, name
   voices [engine] [language]   lists available voices as JSON
   say <text>               tries the TTS engine, ignoring the switch
+  version                  prints the installed version
 
 Environment variables:
   JARVIS_TTS_CMD   shell command that receives the text (UTF-8) on stdin; replaces the default engine
@@ -35,6 +36,7 @@ CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude"
 FLAG = CLAUDE_DIR / "jarvis.on"
 PIDFILE = CLAUDE_DIR / "jarvis.pid"
 CONFIG = CLAUDE_DIR / "jarvis.json"
+VERSION = "1.1.0"
 CONFIG_KEYS = ("engine", "lang", "voice", "name")
 ENGINES = ("system", "edge")
 VENV = CLAUDE_DIR / "jarvis-venv"
@@ -739,6 +741,8 @@ def main():
         lang = rest[0].lower() if rest else ""
         voices = [v for v in list_voices(engine) if not lang or v["lang"].lower() == lang]
         print(json.dumps(voices, ensure_ascii=False))
+    elif cmd == "version":
+        print(VERSION)
     elif cmd == "edge-play":
         cmd_edge_play()
     elif cmd == "edge-voices":

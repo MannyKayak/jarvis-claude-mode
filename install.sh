@@ -109,7 +109,13 @@ if [ "$(uname -s)" = Linux ] && [ -z "${JARVIS_TTS_CMD:-}" ] && ! command -v esp
     esac
 fi
 
-SOURCE="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
+# Use the files next to this script only when it really is a file. Piped from curl, $0 is
+# the shell's name and its "directory" would be wherever the user happens to be standing,
+# possibly an old clone.
+SOURCE=""
+if [ -f "$0" ]; then
+    SOURCE="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
+fi
 TEMP=""
 if [ -z "$SOURCE" ] || [ ! -f "$SOURCE/install.py" ]; then
     echo "Downloading Jarvis mode from github.com/$REPO ..."

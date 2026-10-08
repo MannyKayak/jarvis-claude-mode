@@ -354,7 +354,7 @@ def configure(voices):
 
 
 def cmd_init(dry_run):
-    print("Jarvis mode: guided installation")
+    print(f"Jarvis mode {jarvis.VERSION}: guided installation")
     print("Reads Claude Code's replies aloud at the end of each turn.")
     voices = check_environment()
 
