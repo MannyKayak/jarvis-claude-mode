@@ -14,6 +14,7 @@ original before every change.
 import json
 import os
 import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -220,35 +221,113 @@ def install_files(settings, before):
         print(f"   Copy of settings.json: {backup}")
 
 
+def edge_prerequisites():
+    """Linux only: what the online voices still need, as (what it is, package name)."""
+    missing = []
+    if not sys.platform.startswith("linux"):
+        return missing
+    if subprocess.run([sys.executable, "-c", "import venv, ensurepip"], capture_output=True).returncode:
+        missing.append(("Python's venv module", "python3-venv"))
+    if not jarvis.audio_player():
+        missing.append(("an audio player", "mpg123"))
+    return missing
+
+
+def package_command(packages):
+    """Command installing the packages with this system's package manager, or None."""
+    is_root = getattr(os, "geteuid", lambda: 1)() == 0
+    sudo = ["sudo"] if not is_root and shutil.which("sudo") else []
+    managers = (("apt-get", ["install", "-y"]), ("dnf", ["install", "-y"]),
+                ("pacman", ["-S", "--noconfirm"]), ("zypper", ["install", "-y"]))
+    for manager, args in managers:
+        if shutil.which(manager):
+            # Only Debian-style systems ship venv as a separate package.
+            wanted = [p for p in packages if p != "python3-venv" or manager == "apt-get"]
+            return sudo + [manager] + args + wanted if wanted else None
+    return None
+
+
+def prepare_edge():
+    """Offers to install what the online voices need. Returns True when everything is there."""
+    missing = edge_prerequisites()
+    if not missing:
+        return True
+    print("   The online voices also need: " + " and ".join(what for what, _ in missing) + ".")
+    command = package_command([package for _, package in missing])
+    if command:
+        if confirm(f"   Install now with: {' '.join(command)} ?"):
+            subprocess.run(command)
+    else:
+        packages = [package for _, package in missing]
+        print("   Install with your package manager: " + ", ".join(packages)
+              + (" (ffplay or mpv work as the player too)." if "mpg123" in packages else "."))
+    if edge_prerequisites():
+        print("   Still missing: staying with the system voices. Run this installer again "
+              "once they are installed.")
+        return False
+    return True
+
+
 def configure(voices):
-    print("\n3. Language, voice and name")
+    print("\n3. Engine, language, voice and name")
     cfg = jarvis.load_config()
     if jarvis.CONFIG.exists():
-        print(f"   Current settings: name {cfg['name']}, language {cfg['lang']}, "
-              f"voice {cfg['voice'] or 'system default'}")
+        print(f"   Current settings: name {cfg['name']}, engine {cfg['engine']}, "
+              f"language {cfg['lang']}, voice {cfg['voice'] or 'system default'}")
         if YES or not confirm("   Change them?", default=False):
             return cfg
 
+    print("   Speech engines:")
+    engine = jarvis.ENGINES[choose("   Engine", [
+        "System voices: built in, work offline, sound synthetic",
+        "Microsoft online neural voices: far more natural; they need internet, send every "
+        "spoken summary to Microsoft, and download the edge-tts package",
+    ], jarvis.ENGINES.index(cfg["engine"]))]
+    if engine == "edge" and not prepare_edge():
+        engine = "system"
+    if engine == "edge":
+        print("   Setting up the online voices ...")
+        online = jarvis.list_voices("edge") if jarvis.install_edge() else []
+        if online:
+            voices = online
+        else:
+            print("   Could not set them up (no connection, or Python's venv module is missing): "
+                  "staying with the system voices.")
+            engine = "system"
+    if engine != cfg["engine"]:
+        cfg["voice"] = ""
+    cfg["engine"] = engine
+
     if voices:
         langs = sorted({v["lang"] for v in voices}, key=str.lower)
-        if len(langs) > 1:
-            # Suggest the current/system language, or at least one with the same prefix.
-            preferred = [i for i, lang in enumerate(langs) if lang.lower() == cfg["lang"].lower()] or [
-                i for i, lang in enumerate(langs) if lang[:2].lower() == cfg["lang"][:2].lower()
-            ]
-            print("   Languages with at least one installed voice:")
+        # Suggest the current/system language, or at least one with the same prefix.
+        preferred = [i for i, lang in enumerate(langs) if lang.lower() == cfg["lang"].lower()] or [
+            i for i, lang in enumerate(langs) if lang[:2].lower() == cfg["lang"][:2].lower()
+        ]
+        if len(langs) > 20:
+            suggested = langs[preferred[0]] if preferred else "en-US"
+            while True:
+                answer = ask(f"   Language tag ({len(langs)} available, like en-US or it-IT)", suggested)
+                match = [lang for lang in langs if lang.lower() == answer.lower()]
+                if match:
+                    cfg["lang"] = match[0]
+                    break
+                close = [lang for lang in langs if lang[:2].lower() == answer[:2].lower()]
+                print("   No voices for that tag." + (f" Similar: {', '.join(close)}" if close else ""))
+        elif len(langs) > 1:
+            print("   Languages with at least one voice:")
             cfg["lang"] = langs[choose("   Language", langs, preferred[0] if preferred else 0)]
         else:
             cfg["lang"] = langs[0]
-            print(f"   Only language with installed voices: {cfg['lang']}")
+            print(f"   Only language with voices: {cfg['lang']}")
 
         in_lang = [v for v in voices if v["lang"] == cfg["lang"]]
-        labels = [v["name"] + (f" ({v['gender']})" if v["gender"] else "") for v in in_lang]
+        labels = [jarvis.voice_label(v) for v in in_lang]
         if len(in_lang) == 1:
             cfg["voice"] = in_lang[0]["name"]
             print(f"   Only voice for {cfg['lang']}: {labels[0]}")
         else:
-            print(f"   Voices installed for {cfg['lang']}:")
+            print(f"   Voices for {cfg['lang']}:")
             pick = 0
             while True:
                 pick = choose("   Voice", labels, pick)
@@ -327,6 +406,8 @@ def cmd_uninstall(dry_run):
     print(f"   Remove {SKILL_DIR}")
     print(f"   Remove Jarvis hooks from {SETTINGS} (the others stay)")
     print(f"   Remove state and settings: {', '.join(STATE_FILES)}")
+    if jarvis.VENV.exists():
+        print(f"   Remove the online voices environment: {jarvis.VENV}")
     if dry_run:
         print("[dry-run] Nothing was changed.")
         return
@@ -334,6 +415,7 @@ def cmd_uninstall(dry_run):
         raise Abort("Nothing was changed.")
     jarvis.stop_speaking()
     shutil.rmtree(SKILL_DIR, ignore_errors=True)
+    shutil.rmtree(jarvis.VENV, ignore_errors=True)
     for name in STATE_FILES:
         try:
             (CLAUDE_DIR / name).unlink()

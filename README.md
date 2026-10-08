@@ -10,7 +10,7 @@ Claude ends every reply with a one- or two-sentence summary written to be listen
 - Python 3.8 or later (the installer offers to install it if missing)
 - A speech engine: built into Windows and macOS; on Linux you need `espeak-ng`
 
-No dependencies to install and no external services: speech synthesis is the operating system's own.
+By default there are no dependencies and no external services: speech synthesis is the operating system's own. More natural online voices are optional, see [Speech engines](#speech-engines).
 
 ## Installation
 
@@ -42,7 +42,7 @@ Either way the installation is guided and changes nothing without asking. In ord
 1. looks for Python and, if it is missing, offers to install it (`winget` on Windows, Homebrew on macOS, your package manager on Linux, where it also offers `espeak-ng`);
 2. checks Claude Code, the speech engine and the installed voices;
 3. shows what will change and waits for confirmation;
-4. lets you pick the language, the voice (with an audio preview) and the assistant's name;
+4. lets you pick the speech engine, the language, the voice (with an audio preview) and the assistant's name;
 5. asks whether to turn Jarvis mode on right away.
 
 Then open a new Claude Code session.
@@ -76,10 +76,11 @@ Everything lives in `~/.claude`, so it works in every repo:
 /jarvis-mode setting      changes language, voice and name
 ```
 
-`/jarvis-mode setting` lists the installed voices, grouped by language, and lets you pick:
+`/jarvis-mode setting` lists the available voices, grouped by language, and lets you pick:
 
-- **language**: only those with at least one installed voice; it is also the language of the spoken summary;
-- **voice**: one of those installed for the chosen language;
+- **engine**: the system voices or Microsoft's online ones, see [Speech engines](#speech-engines);
+- **language**: only those with at least one voice; it is also the language of the spoken summary;
+- **voice**: one of those available for the chosen language;
 - **name**: what the voice assistant is called (default `Jarvis`).
 
 To get more voices:
@@ -94,7 +95,11 @@ To get more voices:
 - The voice runs detached from the session, which never waits for it. Only the process started by Jarvis is terminated, identified by its PID and start time.
 - Any script error is silent: a broken hook never blocks Claude Code.
 
-## Speech engine
+## Speech engines
+
+You pick the engine during installation or with `/jarvis-mode setting`.
+
+**`system`** (default): the operating system's voices. Offline, nothing to install, but they sound synthetic.
 
 | System | Engine |
 | --- | --- |
@@ -102,7 +107,14 @@ To get more voices:
 | macOS | `say` |
 | Linux | `espeak-ng` |
 
-To use another engine (piper, ElevenLabs, OpenAI…), set `JARVIS_TTS_CMD` to a shell command that receives the text as UTF-8 on stdin. It can go in the `env` key of `~/.claude/settings.json`:
+**`edge`**: Microsoft's online neural voices, through the [edge-tts](https://github.com/rany2/edge-tts) package. Far more natural, hundreds of voices in over a hundred languages, free and without an account. Before choosing it, know that:
+
+- it needs an internet connection, and **every spoken summary is sent to Microsoft**;
+- it relies on an unofficial service that may change or stop working. When it is unreachable, Jarvis falls back to the system voice;
+- choosing it downloads `edge-tts` into a private virtual environment, `~/.claude/jarvis-venv`, removed on uninstall;
+- on Linux it needs an audio player (`ffplay`, `mpg123` or `mpv`) and, on Debian or Ubuntu, the `python3-venv` package. The installer checks for both and offers to install what is missing.
+
+To use yet another engine (piper, ElevenLabs, OpenAI…), set `JARVIS_TTS_CMD` to a shell command that receives the text as UTF-8 on stdin. It can go in the `env` key of `~/.claude/settings.json`:
 
 ```json
 { "env": { "JARVIS_TTS_CMD": "espeak-ng -v en -s 150 --stdin" } }
