@@ -3,7 +3,8 @@
 
 Subcommands:
   stop                     Stop hook: speaks <spoken>...</spoken> from the last reply
-  prompt                   UserPromptSubmit hook: silences playback and injects the instruction
+  prompt                   UserPromptSubmit hook: silences playback, obeys "<name>, sleep" and
+                           "<name>, wake up", and injects the instruction
   toggle [on|off|status|setting]   switch (no argument flips the state)
   config [--engine E] [--lang X] [--voice Y] [--name Z]   saves engine, language, voice, name
   voices [engine] [language]   lists available voices as JSON
@@ -71,7 +72,16 @@ INSTRUCTION = (
 
 # Phrases spoken by the tool itself, by language prefix; English otherwise.
 GREETINGS = {"it": "{name} è al tuo servizio.", "en": "{name} is ready."}
+FAREWELLS = {"it": "A dopo.", "en": "See you later."}
 SAMPLES = {"it": "Questa è la mia voce.", "en": "This is my voice."}
+
+# Prompts that switch Jarvis mode by themselves when addressed to the assistant by name,
+# typed or dictated: "Jarvis, dormi", "Hey Jarvis, wake up".
+VOICE_COMMANDS = {
+    "sleep": ("dormi", "vai a dormire", "sleep", "go to sleep"),
+    "wake": ("svegliati", "sveglia", "wake up", "wake"),
+}
+CALL_PREFIXES = ("", "hey ", "ehi ", "ok ")
 
 # Voice and language come from JARVIS_VOICE / JARVIS_LANG. The text is read from stdin as raw
 # bytes, so the console encoding never touches accented characters. OneCore voices (the ones
@@ -499,13 +509,45 @@ def cmd_stop():
         speak(text)
 
 
+def voice_command(prompt, name):
+    """"sleep" or "wake" when the whole prompt is that command addressed to `name`, else None."""
+    def plain(text):
+        return " ".join(re.sub(r"[^\w\s']", " ", text.lower()).split())
+
+    text = plain(prompt)
+    for prefix in CALL_PREFIXES:
+        head = prefix + plain(name) + " "
+        if text.startswith(head):
+            for action, phrases in VOICE_COMMANDS.items():
+                if text[len(head):] in phrases:
+                    return action
+    return None
+
+
 def cmd_prompt():
     stop_speaking()
+    prompt = read_hook_input().get("prompt")
+    cfg = load_config()
+    action = voice_command(prompt, cfg["name"]) if isinstance(prompt, str) else None
+    if action:
+        if action == "wake":
+            CLAUDE_DIR.mkdir(parents=True, exist_ok=True)
+            FLAG.touch()
+            speak(greeting(cfg), cfg)
+        else:
+            try:
+                FLAG.unlink()
+            except OSError:
+                pass
+            speak(phrase(FAREWELLS, cfg), cfg)
+        # The command is for Jarvis, not for Claude: stop the prompt here.
+        print(json.dumps({"decision": "block", "reason": status_line(cfg)}))
+        return
     if FLAG.exists():
         out = {
             "hookSpecificOutput": {
                 "hookEventName": "UserPromptSubmit",
-                "additionalContext": INSTRUCTION.format(**load_config()),
+                "additionalContext": INSTRUCTION.format(**cfg),
             }
         }
         print(json.dumps(out))

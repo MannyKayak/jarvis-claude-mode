@@ -76,6 +76,19 @@ Everything lives in `~/.claude`, so it works in every repo:
 /jarvis-mode setting      changes language, voice and name
 ```
 
+### Voice commands
+
+Address the assistant by name, typed or dictated with `/voice`, and it switches itself:
+
+| Say | Effect |
+| --- | --- |
+| `Jarvis, sleep` · `Jarvis, go to sleep` · `Jarvis, dormi` | turns Jarvis mode off |
+| `Jarvis, wake up` · `Jarvis, svegliati` | turns it back on |
+
+Use the name you gave the assistant; `Hey` in front is fine. The command must be the whole message: "Jarvis, sleep and then summarize this" goes to Claude as usual. The message is handled by Jarvis itself and never reaches Claude.
+
+### Settings
+
 `/jarvis-mode setting` lists the available voices, grouped by language, and lets you pick:
 
 - **engine**: the system voices or Microsoft's online ones, see [Speech engines](#speech-engines);
