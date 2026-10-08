@@ -1,0 +1,3 @@
+#!/bin/sh
+# Jarvis mode launcher for macOS and Linux: ./jarvis-mode install | uninstall [--yes] [--dry-run]
+exec sh "$(dirname "$0")/install.sh" "$@"

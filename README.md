@@ -7,42 +7,64 @@ Claude ends every reply with a one- or two-sentence summary written to be listen
 ## Requirements
 
 - Claude Code
-- Python 3.8 or later
+- Python 3.8 or later (the installer offers to install it if missing)
 - A speech engine: built into Windows and macOS; on Linux you need `espeak-ng`
 
 No dependencies to install and no external services: speech synthesis is the operating system's own.
 
 ## Installation
 
+One line, no git needed.
+
+Windows (PowerShell):
+
 ```
-git clone https://github.com/MannyKayak/jarvis-mode.git
-cd jarvis-mode
-python install.py
+irm https://raw.githubusercontent.com/MannyKayak/jarvis-claude-mode/main/install.ps1 | iex
 ```
 
-On macOS and Linux the command is `python3 install.py`.
+macOS and Linux:
 
-The installation is guided and changes nothing without asking. In order, it:
+```
+curl -fsSL https://raw.githubusercontent.com/MannyKayak/jarvis-claude-mode/main/install.sh | sh
+```
 
-1. checks Python, Claude Code, the speech engine and the installed voices;
-2. shows what will change and waits for confirmation;
-3. lets you pick the language, the voice (with an audio preview) and the assistant's name;
-4. asks whether to turn Jarvis mode on right away.
+Prefer to read the code first? Clone the repository and run the launcher:
+
+```
+git clone https://github.com/MannyKayak/jarvis-claude-mode.git
+cd jarvis-claude-mode
+.\jarvis-mode install        # Windows
+./jarvis-mode install        # macOS and Linux
+```
+
+Either way the installation is guided and changes nothing without asking. In order, it:
+
+1. looks for Python and, if it is missing, offers to install it (`winget` on Windows, Homebrew on macOS, your package manager on Linux, where it also offers `espeak-ng`);
+2. checks Claude Code, the speech engine and the installed voices;
+3. shows what will change and waits for confirmation;
+4. lets you pick the language, the voice (with an audio preview) and the assistant's name;
+5. asks whether to turn Jarvis mode on right away.
 
 Then open a new Claude Code session.
 
 | Command | Effect |
 | --- | --- |
-| `python install.py` | guided installation; run it again to update |
-| `python install.py --dry-run` | shows what would change, without writing anything |
-| `python install.py --yes` | no questions, suggested values |
-| `python install.py uninstall` | removes everything |
+| `jarvis-mode install` | guided installation; run it again to update |
+| `jarvis-mode install --dry-run` | shows what would change, without writing anything |
+| `jarvis-mode install --yes` | no questions, suggested values |
+| `jarvis-mode uninstall` | removes everything |
+
+No clone at hand? Uninstall with the copy kept next to the skill:
+
+```
+python ~/.claude/skills/jarvis-mode/install.py uninstall
+```
 
 ### What gets touched
 
 Everything lives in `~/.claude`, so it works in every repo:
 
-- `skills/jarvis-mode/`: the script and the `/jarvis-mode` command;
+- `skills/jarvis-mode/`: the script, the `/jarvis-mode` command and a copy of the installer;
 - `settings.json`: the `Stop` and `UserPromptSubmit` hooks are added. The file is merged, never overwritten, and a copy is saved first as `settings.json.bak-<date>`;
 - `jarvis.json`, `jarvis.on`, `jarvis.pid`: settings and state.
 
@@ -97,7 +119,7 @@ python ~/.claude/skills/jarvis-mode/jarvis.py voices
 
 - **It doesn't speak**: check with `/hooks` that both hooks are registered and with `/jarvis-mode status` that it is on.
 - **`/jarvis-mode` doesn't exist**: open a new session after installing.
-- **You moved or upgraded Python**: run `python install.py` again; the hooks point to the interpreter used to install.
+- **You moved or upgraded Python**: run `jarvis-mode install` again; the hooks point to the interpreter used to install.
 
 Tested on Windows 11. macOS and Linux support is implemented but not yet verified on those platforms.
 

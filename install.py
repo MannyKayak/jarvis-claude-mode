@@ -192,7 +192,7 @@ def check_environment():
 
 def show_plan(settings_before):
     print("\n2. What will change")
-    print(f"   {'Update' if SCRIPT.exists() else 'Create'} {SKILL_DIR} (jarvis.py, SKILL.md)")
+    print(f"   {'Update' if SCRIPT.exists() else 'Create'} {SKILL_DIR} (jarvis.py, install.py, SKILL.md)")
     hooks = settings_before.get("hooks", {}) if isinstance(settings_before.get("hooks"), dict) else {}
     already = all(any(is_ours(e) for e in hooks.get(event, [])) for event, _ in EVENTS)
     if already:
@@ -208,7 +208,11 @@ def show_plan(settings_before):
 
 def install_files(settings, before):
     SKILL_DIR.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(SOURCE, SCRIPT)
+    # install.py goes along too, so uninstalling works without the original download.
+    for source in (SOURCE, Path(__file__).resolve()):
+        target = SKILL_DIR / source.name
+        if source != target.resolve():
+            shutil.copy2(source, target)
     (SKILL_DIR / "SKILL.md").write_text(skill_md(), encoding="utf-8")
     backup = write_settings(settings, before)
     print(f"   Installed in {SKILL_DIR}")
