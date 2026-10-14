@@ -29,7 +29,8 @@ SKILL_DIR = CLAUDE_DIR / "skills" / "jarvis-mode"
 SCRIPT = SKILL_DIR / "jarvis.py"
 SOURCE = Path(__file__).resolve().parent / "jarvis.py"
 EVENTS = (("Stop", "stop"), ("UserPromptSubmit", "prompt"))
-STATE_FILES = ("jarvis.on", "jarvis.pid", "jarvis.json", "jarvis.ack")
+STATE_FILES = ("jarvis.json", "jarvis.ack", "jarvis.sessions")
+LEGACY_FILES = ("jarvis.on", "jarvis.pid")  # the global switch of versions before 1.4
 
 SKILL_MD = """---
 name: jarvis-mode
@@ -39,7 +40,7 @@ disable-model-invocation: true
 allowed-tools: Bash({cmd} *)
 ---
 
-!`{cmd} toggle $ARGUMENTS`
+!`{cmd} toggle --session=${{CLAUDE_SESSION_ID}} $ARGUMENTS`
 """
 
 YES = False
@@ -215,6 +216,11 @@ def install_files(settings, before):
         if source != target.resolve():
             shutil.copy2(source, target)
     (SKILL_DIR / "SKILL.md").write_text(skill_md(), encoding="utf-8")
+    for name in LEGACY_FILES:
+        try:
+            (CLAUDE_DIR / name).unlink()
+        except OSError:
+            pass
     backup = write_settings(settings, before)
     print(f"   Installed in {SKILL_DIR}")
     if backup:
@@ -385,20 +391,18 @@ def cmd_init(dry_run):
 
     cfg = configure(voices)
 
-    print("\n4. Activation")
-    if jarvis.FLAG.exists():
-        print("   Jarvis mode is already on.")
-    elif confirm("   Turn Jarvis mode on now?"):
-        jarvis.FLAG.touch()
-    if jarvis.FLAG.exists() and not YES:
+    if not YES:
         try:
             jarvis.speak(jarvis.greeting(cfg), cfg)
         except Exception:
             pass
 
-    print(f"\nDone. {jarvis.status_line(cfg)}")
-    print("Open a new Claude Code session. Commands:")
-    print("  /jarvis-mode              turns it on or off")
+    voice = cfg["voice"] or "system default"
+    print(f"\nDone. Name: {cfg['name']}, engine: {cfg['engine']}, language: {cfg['lang']}, "
+          f"voice: {voice}.")
+    print("Jarvis starts silent in every Claude Code session and is switched on per session,")
+    print(f'with /jarvis-mode on or by saying "{cfg["name"]}, wake up". Open a new session. Commands:')
+    print("  /jarvis-mode              turns it on or off in that session")
     print("  /jarvis-mode on|off|status")
     print("  /jarvis-mode setting      changes language, voice and name")
 
@@ -424,7 +428,8 @@ def cmd_uninstall(dry_run):
     shutil.rmtree(SKILL_DIR, ignore_errors=True)
     shutil.rmtree(jarvis.VENV, ignore_errors=True)
     shutil.rmtree(jarvis.CACHE, ignore_errors=True)
-    for name in STATE_FILES:
+    shutil.rmtree(jarvis.STATE, ignore_errors=True)
+    for name in STATE_FILES + LEGACY_FILES:
         try:
             (CLAUDE_DIR / name).unlink()
         except OSError:

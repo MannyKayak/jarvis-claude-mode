@@ -42,10 +42,9 @@ Either way the installation is guided and changes nothing without asking. In ord
 1. looks for Python and, if it is missing, offers to install it (`winget` on Windows, Homebrew on macOS, your package manager on Linux, where it also offers `espeak-ng`);
 2. checks Claude Code, the speech engine and the installed voices;
 3. shows what will change and waits for confirmation;
-4. lets you pick the speech engine, the language, the voice (with an audio preview) and the assistant's name;
-5. asks whether to turn Jarvis mode on right away.
+4. lets you pick the speech engine, the language, the voice (with an audio preview) and the assistant's name.
 
-Then open a new Claude Code session.
+Then open a new Claude Code session and turn it on with `/jarvis-mode on`.
 
 | Command | Effect |
 | --- | --- |
@@ -66,16 +65,22 @@ Everything lives in `~/.claude`, so it works in every repo:
 
 - `skills/jarvis-mode/`: the script, the `/jarvis-mode` command and a copy of the installer;
 - `settings.json`: the `Stop` and `UserPromptSubmit` hooks are added. The file is merged, never overwritten, and a copy is saved first as `settings.json.bak-<date>`;
-- `jarvis.json`, `jarvis.on`, `jarvis.pid`, `jarvis.ack`: settings and state;
+- `jarvis.json`, `jarvis.ack`, `jarvis.sessions`, `jarvis-state/`: settings and per-session state;
 - with the online voices only: `jarvis-venv/` (the edge-tts package) and `jarvis-cache/` (the stock phrases, pre-generated).
 
 ## Usage
 
 ```
-/jarvis-mode              turns it on or off
+/jarvis-mode              turns it on or off in this session
 /jarvis-mode on|off|status
 /jarvis-mode setting      changes language, voice and name
 ```
+
+### One switch per session
+
+Jarvis mode is switched on for a single Claude Code session, the one where you run `/jarvis-mode on` or say "Jarvis, wake up". Every new session starts silent, so opening a second terminal never makes it start talking, and turning Jarvis off in one leaves the others alone.
+
+Several sessions can have Jarvis on at once. Each one only ever interrupts its own voice, and when two have something to say at the same moment the second waits for the first to finish instead of talking over it.
 
 ### No silent waits
 
@@ -89,7 +94,7 @@ Address the assistant by name, typed or dictated with `/voice`, and it switches 
 
 | Say | Effect |
 | --- | --- |
-| `Jarvis, sleep` · `Jarvis, go to sleep` · `Jarvis, dormi` | turns Jarvis mode off |
+| `Jarvis, sleep` · `Jarvis, go to sleep` · `Jarvis, dormi` | turns Jarvis mode off in this session |
 | `Jarvis, wake up` · `Jarvis, svegliati` | turns it back on |
 
 Use the name you gave the assistant; `Hey` in front is fine. The command must be the whole message: "Jarvis, sleep and then summarize this" goes to Claude as usual. The message is handled by Jarvis itself and never reaches Claude.
@@ -110,9 +115,9 @@ To get more voices:
 
 ## How it works
 
-- **`UserPromptSubmit` hook**: stops any playback in progress and, when Jarvis is on, asks Claude to end its reply with `<spoken>…</spoken>`.
+- **`UserPromptSubmit` hook**: stops any playback in progress and, when Jarvis is on, asks Claude to end its reply with `<spoken>…</spoken>`. To keep the token cost low, the full request goes out on a session's first message and every tenth after that; the others carry a one-line reminder.
 - **`Stop` hook**: speaks only the content of `<spoken>`. If the tag is missing, it strips code, markdown, URLs and paths and speaks roughly the first 300 characters. Subagent turns are ignored.
-- The voice runs detached from the session, which never waits for it. Only the process started by Jarvis is terminated, identified by its PID and start time.
+- The voice runs detached from the session, which never waits for it. Only the process started by Jarvis for that session is terminated, identified by its PID and start time.
 - Any script error is silent: a broken hook never blocks Claude Code.
 
 ## Speech engines

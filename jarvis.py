@@ -5,7 +5,7 @@ Subcommands:
   stop                     Stop hook: speaks <spoken>...</spoken> from the last reply
   prompt                   UserPromptSubmit hook: silences playback, obeys "<name>, sleep" and
                            "<name>, wake up", and injects the instruction
-  toggle [on|off|status|setting]   switch (no argument flips the state)
+  toggle [on|off|status|setting]   switch for the current session (no argument flips it)
   config [--engine E] [--lang X] [--voice Y] [--name Z]   saves engine, language, voice, name
   voices [engine] [language]   lists available voices as JSON
   say <text>               tries the TTS engine, ignoring the switch
@@ -23,6 +23,10 @@ Speech engines:
   edge     Microsoft's online neural voices through the edge-tts package, installed on demand
            into a private virtual environment; each spoken text is sent to Microsoft
 
+Jarvis mode is switched per Claude Code session: every new session starts silent, and a
+session only ever silences its own voice. When two sessions have something to say at the
+same time, the second waits for the first to finish.
+
 A hook must never break the session: any error -> silent exit 0.
 """
 import hashlib
@@ -39,13 +43,17 @@ import time
 from pathlib import Path
 
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
-FLAG = CLAUDE_DIR / "jarvis.on"
-PIDFILE = CLAUDE_DIR / "jarvis.pid"
+# Per session: <session>.on switches Jarvis on there, <session>.pid tracks its playback.
+STATE = CLAUDE_DIR / "jarvis-state"
+STATE_DAYS = 30
+LOCK = STATE / "voice.lock"
+LOCK_WAIT = 90
 CONFIG = CLAUDE_DIR / "jarvis.json"
-VERSION = "1.2.0"
+VERSION = "1.4.0"
 CONFIG_KEYS = ("engine", "lang", "voice", "name", "ack")
 CACHE = CLAUDE_DIR / "jarvis-cache"
 ACK_STATE = CLAUDE_DIR / "jarvis.ack"
+SESSIONS = CLAUDE_DIR / "jarvis.sessions"
 ENGINES = ("system", "edge")
 VENV = CLAUDE_DIR / "jarvis-venv"
 EDGE_MARKER = VENV / "edge-tts.ok"
@@ -69,16 +77,22 @@ CREATE_NEW_PROCESS_GROUP = 0x00000200
 CREATE_BREAKAWAY_FROM_JOB = 0x01000000
 CREATE_NO_WINDOW = 0x08000000
 
+# Injected into the model's context with every prompt, so every word is paid for each time.
+# The full text goes out on a session's first prompt, again every FULL_EVERY prompts (context
+# may have been compacted since) and when name or language change; the reminder otherwise.
 INSTRUCTION = (
-    "Jarvis mode is on: your reply will be read aloud. "
-    "You are {name}, the user's voice assistant: if asked your name, answer {name}. "
-    "ALWAYS end the final reply of the turn with a <spoken>...</spoken> block on its own "
-    "line: 1-2 full, conversational sentences in the language {lang}, summarizing what you "
-    "did or answered. Inside the tag: no code, paths, URLs, markdown, lists or "
-    "unpronounceable acronyms. The tag content is exempt from any compressed or terse "
-    "style rule: write it the way you would say it out loud. "
-    "Do not mention the tag in the rest of the reply."
+    "Jarvis mode is on: you are {name}, the user's voice assistant, and your reply is read "
+    "aloud. End every final reply with <spoken>...</spoken> on its own line: 1-2 full "
+    "conversational sentences in {lang} saying what you did or answered, with no code, paths, "
+    "URLs or markdown. Write them as you would say them: terse-style rules do not apply "
+    "inside the tag. Never mention the tag."
 )
+REMINDER = (
+    "Jarvis mode: as {name}, end your reply with <spoken>...</spoken>, 1-2 full "
+    "conversational sentences in {lang}."
+)
+FULL_EVERY = 10
+SESSIONS_KEPT = 30
 
 # Phrases spoken by the tool itself, by language prefix; English otherwise.
 GREETINGS = {"it": "{name} è al tuo servizio.", "en": "{name} is ready."}
@@ -453,6 +467,10 @@ def proc_token(pid):
             times = [wintypes.FILETIME() for _ in range(4)]
             if not k.GetProcessTimes(handle, *[ctypes.byref(t) for t in times]):
                 return None
+            # A process that has exited can still be opened while anything holds a handle
+            # to it: a non-zero exit time tells it is gone.
+            if times[1].dwHighDateTime or times[1].dwLowDateTime:
+                return None
             return str((times[0].dwHighDateTime << 32) | times[0].dwLowDateTime)
         finally:
             k.CloseHandle(handle)
@@ -462,14 +480,64 @@ def proc_token(pid):
     return out or None
 
 
-def stop_speaking():
+def session_key(session_id):
+    """File-name-safe form of a session id; "" when there is none."""
+    if not isinstance(session_id, str):
+        return ""
+    return re.sub(r"[^A-Za-z0-9_-]", "", session_id)[:64]
+
+
+def current_session(args=()):
+    """Session a command was run from: --session=<id>, else Claude Code's own variable."""
+    for arg in args:
+        if arg.startswith("--session="):
+            key = session_key(arg.split("=", 1)[1])
+            if key:
+                return key
+    return session_key(os.environ.get("CLAUDE_CODE_SESSION_ID", ""))
+
+
+def flag_file(key):
+    return STATE / f"{key}.on"
+
+
+def pid_file(key):
+    return STATE / f"{key or 'shared'}.pid"
+
+
+def is_on(key):
+    return bool(key) and flag_file(key).exists()
+
+
+def set_on(key, on):
+    if not on:
+        try:
+            flag_file(key).unlink()
+        except OSError:
+            pass
+        return
+    STATE.mkdir(parents=True, exist_ok=True)
+    # Sessions end without telling us: drop what they left behind long ago.
+    cutoff = time.time() - STATE_DAYS * 86400
+    for old in list(STATE.glob("*.on")) + list(STATE.glob("*.pid")):
+        try:
+            if old.stat().st_mtime < cutoff:
+                old.unlink()
+        except OSError:
+            pass
+    flag_file(key).touch()
+
+
+def stop_speaking(key=""):
+    """Ends the playback started by this session, and only that one."""
+    target = pid_file(key)
     try:
-        data = json.loads(PIDFILE.read_text(encoding="utf-8"))
+        data = json.loads(target.read_text(encoding="utf-8"))
         pid, token = int(data["pid"]), data["token"]
     except Exception:
         pid = token = None
     try:
-        PIDFILE.unlink()
+        target.unlink()
     except OSError:
         pass
     if not pid or not token:
@@ -492,8 +560,9 @@ def stop_speaking():
         pass
 
 
-def spawn_detached(cmd, env, text="", shell=False, track=True):
-    """Starts a process that outlives the hook. Tracked, it is the playback a new prompt silences."""
+def spawn_detached(cmd, env, text="", shell=False, track=None):
+    """Starts a process that outlives the hook. `track` names the session whose playback it
+    becomes, the one that session's next prompt silences; None leaves it untracked."""
     kwargs = dict(
         env=env,
         shell=shell,
@@ -510,27 +579,61 @@ def spawn_detached(cmd, env, text="", shell=False, track=True):
             proc = subprocess.Popen(cmd, creationflags=flags, **kwargs)
     else:
         proc = subprocess.Popen(cmd, start_new_session=True, **kwargs)
-    if track:
-        PIDFILE.write_text(
+    if track is not None:
+        STATE.mkdir(parents=True, exist_ok=True)
+        pid_file(track).write_text(
             json.dumps({"pid": proc.pid, "token": proc_token(proc.pid)}), encoding="utf-8"
         )
     proc.stdin.write(text.encode("utf-8"))
     proc.stdin.close()
 
 
-def speak(text, cfg=None):
-    stop_speaking()
-    custom = os.environ.get("JARVIS_TTS_CMD", "").strip()
-    cfg = cfg or load_config()
-    if cfg["engine"] == "edge" and cfg["voice"] and edge_ready():
-        default = [str(venv_python()), os.path.abspath(__file__), "edge-play"]
-        env = dict(os.environ, JARVIS_VOICE=cfg["voice"], JARVIS_LANG=cfg["lang"])
-    else:
-        voice = cfg["voice"] if cfg["engine"] == "system" else ""
-        default, env = tts_command(
-            cfg["lang"], voice or os.environ.get("JARVIS_VOICE", "").strip()
-        )
-    spawn_detached(custom or default, env, text, shell=bool(custom))
+def acquire_voice(wait):
+    """One voice at a time across sessions: takes the lock, waiting up to `wait` seconds.
+    A lock whose holder is gone (killed mid-sentence) is taken over."""
+    STATE.mkdir(parents=True, exist_ok=True)
+    deadline = time.time() + wait
+    unreadable = 0
+    while True:
+        try:
+            fd = os.open(str(LOCK), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump({"pid": os.getpid(), "token": proc_token(os.getpid())}, handle)
+            return True
+        except FileExistsError:
+            pass
+        try:
+            holder = json.loads(LOCK.read_text(encoding="utf-8"))
+            alive = proc_token(int(holder["pid"])) == holder["token"]
+            unreadable = 0
+        except Exception:
+            alive = True  # probably being written right now
+            unreadable += 1
+        if not alive or unreadable > 5:
+            try:
+                LOCK.unlink()
+            except OSError:
+                pass
+            continue
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.15)
+
+
+def release_voice():
+    try:
+        if json.loads(LOCK.read_text(encoding="utf-8"))["pid"] == os.getpid():
+            LOCK.unlink()
+    except Exception:
+        pass
+
+
+def speak(text, cfg=None, key=""):
+    """Speaks in the background for session `key`, after any other session that is talking."""
+    stop_speaking(key)
+    job = {"kind": "say", "text": text, "session": key, "cfg": cfg or load_config()}
+    spawn_detached([sys.executable, os.path.abspath(__file__), "worker"],
+                   dict(os.environ), json.dumps(job), track=key)
 
 
 def ack_phrases(cfg):
@@ -551,10 +654,10 @@ def warm_ack_cache(cfg):
     if (cfg["ack"] != "off" and cfg["engine"] == "edge" and cfg["voice"] and edge_ready()
             and ack_phrases(cfg)):
         spawn_detached([str(venv_python()), os.path.abspath(__file__), "edge-cache"],
-                       dict(os.environ), track=False)
+                       dict(os.environ))
 
 
-def acknowledge(cfg):
+def acknowledge(cfg, key):
     """Starts the turn's companion process, which fills the wait for the reply."""
     phrases = ack_phrases(cfg)
     if not phrases:
@@ -568,41 +671,69 @@ def acknowledge(cfg):
         ACK_STATE.write_text(str(pick), encoding="utf-8")
     except OSError:
         pass
-    spawn_detached([sys.executable, os.path.abspath(__file__), "attend"],
-                   dict(os.environ), phrases[pick])
+    job = {"kind": "attend", "text": phrases[pick], "session": key, "cfg": cfg}
+    spawn_detached([sys.executable, os.path.abspath(__file__), "worker"],
+                   dict(os.environ), json.dumps(job), track=key)
 
 
-def say_blocking(text, cfg):
-    """Speaks a stock phrase and waits for it to end. Online voices only play what is cached."""
+def say_now(text, cfg):
+    """Speaks any text with the configured engine and waits for it to end."""
     flags = {"creationflags": CREATE_NO_WINDOW} if WINDOWS else {}
     custom = os.environ.get("JARVIS_TTS_CMD", "").strip()
-    online = cfg["engine"] == "edge" and cfg["voice"] and edge_ready()
-    if online and not custom:
-        ready = ack_file(cfg["voice"], text)
-        if ready.exists():
-            play_file(ready)
-        else:
-            warm_ack_cache(cfg)  # stay quiet this time rather than answer late
-        return
     voice = cfg["voice"] if cfg["engine"] == "system" else ""
     cmd, env = tts_command(cfg["lang"], voice or os.environ.get("JARVIS_VOICE", "").strip())
-    subprocess.run(custom or cmd, shell=bool(custom), input=text.encode("utf-8"), env=env,
+    if custom:
+        cmd = custom
+    elif cfg["engine"] == "edge" and cfg["voice"] and edge_ready():
+        cmd = [str(venv_python()), os.path.abspath(__file__), "edge-play"]
+        env = dict(os.environ, JARVIS_VOICE=cfg["voice"], JARVIS_LANG=cfg["lang"])
+    subprocess.run(cmd, shell=bool(custom), input=text.encode("utf-8"), env=env,
                    capture_output=True, **flags)
 
 
-def cmd_attend():
-    """A turn's companion: says the acknowledgement on stdin, then one "still thinking" if the
-    reply is slow. It is the tracked playback, so the Stop hook or the next prompt ends it."""
-    text = sys.stdin.buffer.read().decode("utf-8", "replace")
-    cfg = load_config()
+def say_stock(text, cfg):
+    """Speaks a stock phrase at once: online voices only play what is already cached."""
+    online = cfg["engine"] == "edge" and cfg["voice"] and edge_ready()
+    if not online or os.environ.get("JARVIS_TTS_CMD", "").strip():
+        say_now(text, cfg)
+        return
+    ready = ack_file(cfg["voice"], text)
+    if ready.exists():
+        play_file(ready)
+    else:
+        warm_ack_cache(cfg)  # stay quiet this time rather than answer late
+
+
+def cmd_worker():
+    """The detached process behind every utterance; its job arrives as JSON on stdin. It is
+    the session's tracked playback, so that session's Stop hook or next prompt ends it."""
+    job = json.loads(sys.stdin.buffer.read().decode("utf-8", "replace"))
+    cfg = dict(load_config(), **job.get("cfg", {}))
+    key = job.get("session", "")
+    if job["kind"] == "attend":
+        # The acknowledgement, then one "still thinking" if the reply is slow. Neither is worth
+        # queueing: when another session is talking, stay quiet instead of talking late.
+        for text in (job["text"], None):
+            if text is None:
+                time.sleep(STILL_AFTER)
+                phrases = still_phrases(cfg)
+                if not phrases or not is_on(key):
+                    return
+                text = random.choice(phrases)
+            if acquire_voice(0):
+                try:
+                    say_stock(text, cfg)
+                except Exception:
+                    pass
+                finally:
+                    release_voice()
+        return
+    held = acquire_voice(LOCK_WAIT)  # after waiting that long, speak anyway
     try:
-        say_blocking(text, cfg)
-    except Exception:
-        pass
-    time.sleep(STILL_AFTER)
-    phrases = still_phrases(cfg)
-    if phrases and FLAG.exists():
-        say_blocking(random.choice(phrases), cfg)
+        say_now(job["text"], cfg)
+    finally:
+        if held:
+            release_voice()
 
 
 def strip_markdown(text):
@@ -654,17 +785,16 @@ def read_hook_input():
 
 
 def cmd_stop():
-    if not FLAG.exists():
-        return
     data = read_hook_input()
-    if data.get("agent_id"):  # a subagent's turn
+    key = session_key(data.get("session_id"))
+    if not is_on(key) or data.get("agent_id"):  # off here, or a subagent's turn
         return
     message = data.get("last_assistant_message")
     if not isinstance(message, str):
         return
     text = spoken_text(message)
     if text:
-        speak(text)
+        speak(text, None, key)
 
 
 def voice_command(prompt, name):
@@ -682,36 +812,56 @@ def voice_command(prompt, name):
     return None
 
 
+def instruction_for(session_id, cfg):
+    """The full instruction when the session needs it, the short reminder otherwise."""
+    signature = f"{cfg['name']}|{cfg['lang']}"
+    try:
+        seen = json.loads(SESSIONS.read_text(encoding="utf-8"))
+    except Exception:
+        seen = {}
+    if not isinstance(seen, dict):
+        seen = {}
+    entry = seen.get(session_id) if isinstance(session_id, str) else None
+    count, known = entry if isinstance(entry, list) and len(entry) == 2 else (0, "")
+    if not isinstance(count, int) or known != signature:
+        count = 0
+    full = not isinstance(session_id, str) or count % FULL_EVERY == 0
+    if isinstance(session_id, str):
+        seen.pop(session_id, None)
+        seen[session_id] = [count + 1, signature]
+        for old in list(seen)[:-SESSIONS_KEPT]:
+            del seen[old]
+        try:
+            SESSIONS.write_text(json.dumps(seen), encoding="utf-8")
+        except OSError:
+            pass
+    return (INSTRUCTION if full else REMINDER).format(**cfg)
+
+
 def cmd_prompt():
-    stop_speaking()
-    prompt = read_hook_input().get("prompt")
+    data = read_hook_input()
+    key = session_key(data.get("session_id"))
+    stop_speaking(key)
+    prompt = data.get("prompt")
     cfg = load_config()
-    action = voice_command(prompt, cfg["name"]) if isinstance(prompt, str) else None
+    action = voice_command(prompt, cfg["name"]) if isinstance(prompt, str) and key else None
     if action:
-        if action == "wake":
-            CLAUDE_DIR.mkdir(parents=True, exist_ok=True)
-            FLAG.touch()
-            speak(greeting(cfg), cfg)
-        else:
-            try:
-                FLAG.unlink()
-            except OSError:
-                pass
-            speak(phrase(FAREWELLS, cfg), cfg)
+        set_on(key, action == "wake")
+        speak(greeting(cfg) if action == "wake" else phrase(FAREWELLS, cfg), cfg, key)
         # The command is for Jarvis, not for Claude: stop the prompt here.
-        print(json.dumps({"decision": "block", "reason": status_line(cfg)}))
+        print(json.dumps({"decision": "block", "reason": status_line(cfg, key)}))
         return
-    if FLAG.exists():
+    if is_on(key):
         typed = prompt.strip() if isinstance(prompt, str) else ""
         if cfg["ack"] != "off" and typed and typed[0] not in "/!#":
             try:
-                acknowledge(cfg)
+                acknowledge(cfg, key)
             except Exception:
                 pass
         out = {
             "hookSpecificOutput": {
                 "hookEventName": "UserPromptSubmit",
-                "additionalContext": INSTRUCTION.format(**cfg),
+                "additionalContext": instruction_for(data.get("session_id"), cfg),
             }
         }
         print(json.dumps(out))
@@ -725,10 +875,10 @@ def self_command():
     return f"{quote(sys.executable)} {quote(os.path.abspath(__file__))}"
 
 
-def status_line(cfg):
-    state = "ON" if FLAG.exists() else "OFF"
+def status_line(cfg, key=""):
+    state = "ON" if is_on(key) else "OFF"
     voice = cfg["voice"] or "system default"
-    return (f"Jarvis mode: {state} (name: {cfg['name']}, engine: {cfg['engine']}, "
+    return (f"Jarvis mode: {state} in this session (name: {cfg['name']}, engine: {cfg['engine']}, "
             f"language: {cfg['lang']}, voice: {voice}, acknowledgement: {cfg['ack']})")
 
 
@@ -739,10 +889,10 @@ def voices_by_lang(voices):
     return langs
 
 
-def print_setup(cfg):
+def print_setup(cfg, key=""):
     """Instructions for Claude: the user makes the choices, through AskUserQuestion."""
     me = self_command()
-    print(status_line(cfg))
+    print(status_line(cfg, key))
     print("\nSpeech engines:")
     print("- system: the operating system's voices. Works offline. Sounds synthetic.")
     print("- edge: Microsoft's online neural voices, far more natural. Needs internet; every "
@@ -785,29 +935,32 @@ def print_setup(cfg):
 
 
 def cmd_toggle(args):
+    key = current_session(args)
+    args = [a for a in args if not a.startswith("--session=")]
     arg = args[0].lower() if args else "toggle"
     if arg in ("setting", "settings", "setup", "config"):
-        print_setup(load_config())
+        print_setup(load_config(), key)
         return
     if arg not in ("on", "off", "status", "toggle"):
         print("Usage: /jarvis-mode [on|off|status|setting]")
         arg = "status"
+    if arg != "status" and not key:
+        print("Could not tell which Claude Code session this is, so nothing was changed. "
+              "Jarvis mode is switched per session: run /jarvis-mode inside the session.")
+        return
     if arg == "toggle":
-        arg = "off" if FLAG.exists() else "on"
+        arg = "off" if is_on(key) else "on"
     if arg == "on":
-        CLAUDE_DIR.mkdir(parents=True, exist_ok=True)
-        FLAG.touch()
+        set_on(key, True)
         if not CONFIG.exists():  # first activation
-            print_setup(load_config())
+            print_setup(load_config(), key)
             return
     elif arg == "off":
-        try:
-            FLAG.unlink()
-        except OSError:
-            pass
-        stop_speaking()
-    print(status_line(load_config()))
-    print("\nReport the status above to the user in a single line. Do nothing else.")
+        set_on(key, False)
+        stop_speaking(key)
+    print(status_line(load_config(), key))
+    print("\nReport the status above to the user in a single line, mentioning that the switch "
+          "applies to this session only. Do nothing else.")
 
 
 def cmd_config(args):
@@ -879,8 +1032,9 @@ def cmd_config(args):
             return
         cfg["name"] = name
     save_config(cfg)
-    print("Saved. " + status_line(cfg))
-    speak(greeting(cfg), cfg)
+    key = current_session()
+    print("Saved. " + status_line(cfg, key))
+    speak(greeting(cfg), cfg, key)
     warm_ack_cache(cfg)
 
 
@@ -909,14 +1063,14 @@ def main():
         print(VERSION)
     elif cmd == "edge-play":
         cmd_edge_play()
-    elif cmd == "attend":
-        cmd_attend()
+    elif cmd == "worker":
+        cmd_worker()
     elif cmd == "edge-cache":
         cmd_edge_cache()
     elif cmd == "edge-voices":
         cmd_edge_voices()
     elif cmd == "say":
-        speak(" ".join(args[1:]))
+        speak(" ".join(args[1:]), None, current_session())
 
 
 if __name__ == "__main__":
