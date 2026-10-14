@@ -49,7 +49,7 @@ STATE_DAYS = 30
 LOCK = STATE / "voice.lock"
 LOCK_WAIT = 90
 CONFIG = CLAUDE_DIR / "jarvis.json"
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 CONFIG_KEYS = ("engine", "lang", "voice", "name", "ack")
 CACHE = CLAUDE_DIR / "jarvis-cache"
 ACK_STATE = CLAUDE_DIR / "jarvis.ack"
@@ -400,9 +400,13 @@ def cmd_edge_play():
             import edge_tts
 
             talk = edge_tts.Communicate(text, os.environ.get("JARVIS_VOICE", ""))
-            asyncio.run(asyncio.wait_for(talk.save(path), 20))
+            # Synthesis runs at roughly 70 characters a second: a full reply takes ~20 s.
+            asyncio.run(asyncio.wait_for(talk.save(path), 20 + len(text) / 25))
             play_file(path)
-        except Exception:
+        except Exception as error:
+            if "403" in str(error):
+                # The service rejects outdated clients: update edge-tts for the next reply.
+                upgrade_edge()
             # Offline, service down or no player: say it with the system voice instead.
             cmd, env = tts_command(lang, "")
             flags = {"creationflags": CREATE_NO_WINDOW} if WINDOWS else {}
@@ -431,11 +435,14 @@ def cmd_edge_cache():
             talk = edge_tts.Communicate(text, cfg["voice"])
             asyncio.run(asyncio.wait_for(talk.save(str(partial)), 30))
             os.replace(partial, target)
-        except Exception:
+        except Exception as error:
             try:
                 partial.unlink()
             except OSError:
                 pass
+            if "403" in str(error):
+                upgrade_edge()
+                return
 
 
 def cmd_edge_voices():
@@ -558,6 +565,12 @@ def stop_speaking(key=""):
             os.killpg(pid, signal.SIGTERM)
     except Exception:
         pass
+
+
+def upgrade_edge():
+    """Updates edge-tts in the background; Microsoft rejects old versions of its handshake."""
+    spawn_detached([str(venv_python()), "-m", "pip", "install", "--quiet",
+                    "--disable-pip-version-check", "--upgrade", "edge-tts"], dict(os.environ))
 
 
 def spawn_detached(cmd, env, text="", shell=False, track=None):
